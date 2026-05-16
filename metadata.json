@@ -1,0 +1,8 @@
+{
+  "name": "LocalityMind - Strategic Market Intelligence",
+  "description": "AI-powered market feasibility tool for estimating store revenue, footfall, and demographic per capita income based on spatial and socioeconomic data.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ]
+}
