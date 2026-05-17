@@ -32,6 +32,11 @@ export interface LocalityMetrics {
     };
   };
   tourismProfile: string;
+  spatialHotspots?: {
+    name: string;
+    offset: { lat: number; lng: number };
+    peakHours: number[];
+  }[];
   storeCompetition: {
     type: string;
     avgPricePoint: string;

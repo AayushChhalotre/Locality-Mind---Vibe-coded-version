@@ -9,15 +9,19 @@ import {
   History, X, ChevronRight, BarChart3, ArrowRightLeft,
   Trash2, PlusCircle, Maximize2, Menu, GraduationCap, Hotel, Landmark, Navigation, Search, Layers, Settings2, Box, RotateCcw, ChevronDown, 
   Coffee, Utensils, Zap, Briefcase, Pill, ShoppingCart, Ticket, Shirt, MoreHorizontal, IndianRupee, Hash, DollarSign, Euro, Banknote, LocateFixed,
-  Clock, Flame, Play, Pause, Database, Link as LinkIcon
+  Clock, Flame, Play, Pause, Database, Link as LinkIcon, UserCircle
 } from 'lucide-react';
 import maplibregl from 'maplibre-gl';
+import { onAuthStateChanged } from 'firebase/auth';
+import { auth } from './services/firebaseClient';
 import { StoreInput, AnalysisResult, StoreCategory, PricingTier } from './types';
 import { GeminiService } from './services/geminiService';
+import { logSearchEvent } from './services/firebaseClient';
 import { MetricCard } from './components/MetricCard';
 import { RevenueChart } from './components/RevenueChart';
 import { TrafficLandscape } from './components/TrafficLandscape';
 import { CompetitionPanel } from './components/CompetitionPanel';
+import { AuthModal } from './components/AuthModal';
 
 const CURRENCIES = [
   { code: 'INR', label: '₹ Indian Rupee', icon: IndianRupee },
@@ -52,15 +56,38 @@ const App: React.FC = () => {
   const searchTimeout = useRef<number | null>(null);
   
   const [loading, setLoading] = useState(false);
-  const [history, setHistory] = useState<AnalysisResult[]>([]);
+  const [history, setHistory] = useState<AnalysisResult[]>(() => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        const saved = window.localStorage.getItem('localityMindHistory');
+        return saved ? JSON.parse(saved) : [];
+      }
+      return [];
+    } catch {
+      return [];
+    }
+  });
+
+  useEffect(() => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.setItem('localityMindHistory', JSON.stringify(history));
+      }
+    } catch {
+      // Ignore write errors in iframe
+    }
+  }, [history]);
+
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [compareMode, setCompareMode] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [userLocation, setUserLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [locationStatus, setLocationStatus] = useState<'prompt' | 'granted' | 'denied' | 'error'>('prompt');
   const [isPanelExpanded, setIsPanelExpanded] = useState(false);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [isAnonymous, setIsAnonymous] = useState(true);
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
   
-  const [is3D, setIs3D] = useState(true);
   const [pitch, setPitch] = useState(60);
   const [bearing, setBearing] = useState(-20);
 
@@ -75,6 +102,29 @@ const App: React.FC = () => {
   const [mapTime, setMapTime] = useState<number>(new Date().getHours());
   const [isAutoplay, setIsAutoplay] = useState(false);
   const autoplayRef = useRef<number | null>(null);
+
+  // Auth Effect
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    try {
+      if (auth) {
+        unsubscribe = onAuthStateChanged(auth, (user) => {
+          if (user) {
+            setIsLoggedIn(true);
+            setIsAnonymous(user.isAnonymous);
+          } else {
+            setIsLoggedIn(false);
+            setIsAnonymous(true);
+          }
+        });
+      }
+    } catch {
+      // Ignore auth errors
+    }
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, []);
   
   const [input, setInput] = useState<StoreInput>({
     location: '',
@@ -146,18 +196,32 @@ const App: React.FC = () => {
     mapInstance.on('load', () => {
       map.current = mapInstance;
 
-      // 1. Add heatmap sources
+      // 1. Add 3D Buildings if building layer exists
+      const layers = mapInstance.getStyle().layers;
+      const buildingLayer = layers.find((l: any) => l['source-layer'] === 'building');
+      
+      if (buildingLayer) {
+        mapInstance.addLayer({
+          'id': '3d-buildings',
+          'source': buildingLayer.source,
+          'source-layer': 'building',
+          'type': 'fill-extrusion',
+          'minzoom': 14,
+          'paint': {
+            'fill-extrusion-color': '#1e1e24',
+            'fill-extrusion-height': ['*', ['get', 'render_height'], 1.5],
+            'fill-extrusion-base': ['*', ['get', 'render_min_height'], 1.5],
+            'fill-extrusion-opacity': 0.8
+          }
+        });
+      }
+
+      // 2. Add heatmap source & layer for traffic
       mapInstance.addSource('traffic-heatmap', {
         type: 'geojson',
         data: { type: 'FeatureCollection', features: [] }
       });
 
-      mapInstance.addSource('poi-density', {
-        type: 'geojson',
-        data: { type: 'FeatureCollection', features: [] }
-      });
-
-      // 2. Add traffic heatmap layer
       mapInstance.addLayer({
         id: 'traffic-heat',
         type: 'heatmap',
@@ -188,62 +252,86 @@ const App: React.FC = () => {
         }
       });
 
-      // 3. Add 3D buildings layer
-      const buildingsSource = mapInstance.getSource('openmaptiles') ? 'openmaptiles' : 
-                             mapInstance.getSource('carto') ? 'carto' : null;
+      // 3. Add POI GeoJSON Sources
+      mapInstance.addSource('poi-schools', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+      mapInstance.addSource('poi-hotels', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
+      mapInstance.addSource('poi-worship', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: [] }
+      });
 
-      if (buildingsSource) {
-        mapInstance.addLayer({
-          'id': '3d-buildings',
-          'source': buildingsSource,
-          'source-layer': 'building',
-          'type': 'fill-extrusion',
-          'minzoom': 15,
-          'paint': {
-            'fill-extrusion-color': '#4f46e5',
-            'fill-extrusion-height': ['get', 'render_height'],
-            'fill-extrusion-base': ['get', 'render_min_height'],
-            'fill-extrusion-opacity': 0.6
-          }
-        });
-      }
-
-      // 4. Add POI Density Heatmap layer after 3D buildings
+      // 4. Add Corresponding Circle Layers (ensure these are added after 3D buildings naturally)
+      
+      // Cyan for Schools
       mapInstance.addLayer({
-        id: 'poi-heat',
-        type: 'heatmap',
-        source: 'poi-density',
-        maxzoom: 18,
+        id: 'poi-circle-schools',
+        type: 'circle',
+        source: 'poi-schools',
         paint: {
-          'heatmap-weight': ['get', 'weight'],
-          'heatmap-intensity': [
-            'interpolate', ['linear'], ['zoom'],
-            0, 1,
-            18, 4
-          ],
-          'heatmap-color': [
-            'interpolate', ['linear'], ['heatmap-density'],
-            0, 'rgba(0,0,0,0)',
-            0.2, 'rgba(16, 185, 129, 0.2)', // Emerald
-            0.4, 'rgba(16, 185, 129, 0.5)',
-            0.6, 'rgba(245, 158, 11, 0.7)', // Amber
-            0.8, 'rgba(245, 158, 11, 0.9)',
-            1, 'rgba(255, 255, 255, 1)'
-          ],
-          'heatmap-radius': [
-            'interpolate', ['linear'], ['zoom'],
+          'circle-radius': [
+            'interpolate', ['linear'], ['get', 'count'],
             0, 5,
-            18, 80
+            50, 40
           ],
-          'heatmap-opacity': 0.6
+          'circle-color': '#06b6d4', // Cyan
+          'circle-opacity': 0.7,
+          'circle-stroke-width': 2,
+          'circle-stroke-color': '#ffffff'
+        }
+      });
+
+      // Gold for Hotels
+      mapInstance.addLayer({
+        id: 'poi-circle-hotels',
+        type: 'circle',
+        source: 'poi-hotels',
+        paint: {
+          'circle-radius': [
+            'interpolate', ['linear'], ['get', 'count'],
+            0, 5,
+            50, 40
+          ],
+          'circle-color': '#eab308', // Gold
+          'circle-opacity': 0.7,
+          'circle-stroke-width': 2,
+          'circle-stroke-color': '#ffffff'
+        }
+      });
+
+      // Violet for Places of Worship
+      mapInstance.addLayer({
+        id: 'poi-circle-worship',
+        type: 'circle',
+        source: 'poi-worship',
+        paint: {
+          'circle-radius': [
+            'interpolate', ['linear'], ['get', 'count'],
+            0, 5,
+            50, 40
+          ],
+          'circle-color': '#8b5cf6', // Violet
+          'circle-opacity': 0.7,
+          'circle-stroke-width': 2,
+          'circle-stroke-color': '#ffffff'
         }
       });
     });
 
-    mapInstance.on('rotate', () => setBearing(mapInstance.getBearing()));
-    mapInstance.on('pitch', () => setPitch(mapInstance.getPitch()));
+    mapInstance.on('rotate', () => { if (mapInstance) setBearing(mapInstance.getBearing()); });
+    mapInstance.on('pitch', () => { if (mapInstance) setPitch(mapInstance.getPitch()); });
     
-    return () => mapInstance?.remove();
+    return () => {
+      if (mapInstance) {
+        mapInstance.remove();
+        map.current = null;
+      }
+    };
   }, []);
 
   // Update Map Layers Data (Footfall & POIs)
@@ -253,18 +341,19 @@ const App: React.FC = () => {
     // --- Update Footfall Heatmap ---
     const trafficSource = map.current.getSource('traffic-heatmap') as maplibregl.GeoJSONSource;
     if (trafficSource) {
-      const trafficAtHour = currentResult.metrics.footfallEstimate.hourlyDistribution.find(d => d.hour === mapTime)?.traffic || 0;
-      const maxTraffic = Math.max(...currentResult.metrics.footfallEstimate.hourlyDistribution.map(d => d.traffic));
-      const globalIntensity = trafficAtHour / (maxTraffic || 1);
+      const dist = currentResult.metrics.footfallEstimate?.hourlyDistribution || [];
+      const trafficAtHour = dist.find(d => d.hour === mapTime)?.traffic || 0;
+      const maxTraffic = dist.length > 0 ? Math.max(...dist.map(d => d.traffic)) : 1;
+      const globalIntensity = trafficAtHour / maxTraffic;
 
       const center = currentResult.originalInput.coordinates || INITIAL_POS;
       const trafficFeatures: any[] = [];
       
-      const trafficHotspots = [
-        { name: 'Transit Node', offset: { lat: 0.002, lng: -0.003 }, peakHours: [9, 18] },
-        { name: 'Office District', offset: { lat: -0.002, lng: 0.004 }, peakHours: [12, 13, 14, 15] },
-        { name: 'Residential Hub', offset: { lat: 0.003, lng: 0.002 }, peakHours: [19, 20, 21] }
-      ];
+      const trafficHotspots = currentResult.metrics.spatialHotspots && currentResult.metrics.spatialHotspots.length > 0 
+        ? currentResult.metrics.spatialHotspots 
+        : [
+            { name: 'Generated Core', offset: { lat: 0, lng: 0 }, peakHours: [12, 13, 18, 19] }
+          ];
 
       trafficHotspots.forEach(spot => {
         let localPeakIntensity = 0.2;
@@ -291,38 +380,59 @@ const App: React.FC = () => {
       trafficSource.setData({ type: 'FeatureCollection', features: trafficFeatures });
     }
 
-    // --- Update POI Density Heatmap ---
-    const poiSource = map.current.getSource('poi-density') as maplibregl.GeoJSONSource;
-    if (poiSource) {
-      const center = currentResult.originalInput.coordinates || INITIAL_POS;
-      const poiFeatures: any[] = [];
-      const pois = currentResult.metrics.nearbyPOIs;
+    // --- Update POI Data ---
+    const center = currentResult.originalInput.coordinates || INITIAL_POS;
+    const pois = currentResult.metrics.nearbyPOIs;
 
-      // Helper to generate a cluster of points for a category
-      const addPoiCluster = (count: number, weight: number, latOffset: number, lngOffset: number) => {
-        for (let i = 0; i < Math.min(count * 5, 50); i++) {
-          const radius = 0.004 * Math.sqrt(Math.random());
-          const angle = Math.random() * Math.PI * 2;
-          poiFeatures.push({
-            type: 'Feature',
-            properties: { weight: weight },
-            geometry: {
-              type: 'Point',
-              coordinates: [
-                center.lng + lngOffset + radius * Math.cos(angle),
-                center.lat + latOffset + radius * Math.sin(angle)
-              ]
-            }
-          });
-        }
-      };
+    // Schools
+    const schoolSource = map.current.getSource('poi-schools') as maplibregl.GeoJSONSource;
+    if (schoolSource) {
+      const count = (pois.schools || 0) + (pois.premiumSchools || 0);
+      schoolSource.setData({
+        type: 'FeatureCollection',
+        features: [{
+          type: 'Feature',
+          properties: { count },
+          geometry: {
+            type: 'Point',
+            coordinates: [center.lng + 0.003, center.lat - 0.002] // Slightly offset
+          }
+        }]
+      });
+    }
 
-      // Distribute clusters around the center
-      addPoiCluster(pois.schools + pois.premiumSchools, 0.8, 0.003, -0.002); // Education Cluster
-      addPoiCluster(pois.hotels.luxury + pois.hotels.midTier + pois.hotels.budget, 1.0, -0.004, 0.003); // Hospitality Cluster
-      addPoiCluster(pois.placesOfWorship, 0.6, 0.001, 0.005); // Community Cluster
+    // Hotels
+    const hotelSource = map.current.getSource('poi-hotels') as maplibregl.GeoJSONSource;
+    if (hotelSource) {
+      const count = (pois.hotels?.luxury || 0) + (pois.hotels?.midTier || 0) + (pois.hotels?.budget || 0);
+      hotelSource.setData({
+        type: 'FeatureCollection',
+        features: [{
+          type: 'Feature',
+          properties: { count },
+          geometry: {
+            type: 'Point',
+            coordinates: [center.lng - 0.004, center.lat + 0.003] // Slightly offset
+          }
+        }]
+      });
+    }
 
-      poiSource.setData({ type: 'FeatureCollection', features: poiFeatures });
+    // Worship
+    const worshipSource = map.current.getSource('poi-worship') as maplibregl.GeoJSONSource;
+    if (worshipSource) {
+      const count = pois.placesOfWorship || 0;
+      worshipSource.setData({
+        type: 'FeatureCollection',
+        features: [{
+          type: 'Feature',
+          properties: { count },
+          geometry: {
+            type: 'Point',
+            coordinates: [center.lng + 0.001, center.lat + 0.005] // Slightly offset
+          }
+        }]
+      });
     }
   }, [currentResult, mapTime]);
 
@@ -347,7 +457,11 @@ const App: React.FC = () => {
       searchTimeout.current = window.setTimeout(async () => {
         try {
           const biasParams = userLocation ? `&lat=${userLocation.lat}&lon=${userLocation.lng}` : '';
-          const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(val)}${biasParams}&countrycodes=in&limit=10`);
+          const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(val)}${biasParams}&countrycodes=in&limit=10`, {
+            headers: {
+              'User-Agent': 'LocalityMind/1.0 (feasiability-preview)'
+            }
+          });
           const data = await response.json();
           let results = data.map((item: any) => {
             const lat = parseFloat(item.lat);
@@ -404,14 +518,25 @@ const App: React.FC = () => {
   };
 
   const handleAnalyze = async () => {
+    if (!input.location || !input.length || !input.breadth || input.length <= 0 || input.breadth <= 0 || input.floors <= 0) {
+      setError('Please provide a valid location and numeric store dimensions > 0.');
+      return;
+    }
+    
     setLoading(true);
     setError(null);
     setIsPanelExpanded(false);
     try {
-      const data = await GeminiService.analyzeMarket({
+      const apiInput = {
         ...input,
         businessDescription: input.businessDescription || archetypeQuery
-      });
+      };
+
+      // 1. Log search intent first
+      logSearchEvent(apiInput).catch(console.error);
+
+      // 2. Fetch analysis from the API
+      const data = await GeminiService.analyzeMarket(apiInput);
       const newResult: AnalysisResult = {
         ...data,
         id: crypto.randomUUID(),
@@ -445,7 +570,6 @@ const App: React.FC = () => {
     setPitch(60); setBearing(-20);
     if (map.current) { map.current.setPitch(60); map.current.setBearing(-20); }
   };
-  const toggle3D = () => setIs3D(!is3D);
   const handlePitchChange = (val: number) => { setPitch(val); if (map.current) map.current.setPitch(val); };
   const handleBearingChange = (val: number) => { setBearing(val); if (map.current) map.current.setBearing(val); };
 
@@ -471,27 +595,31 @@ const App: React.FC = () => {
   return (
     <div className="flex flex-col h-screen bg-slate-950 text-slate-900 overflow-hidden relative" onClick={() => { setShowSuggestions(false); setIsPanelExpanded(false); setShowArchetypeSuggestions(false); }}>
       <header className="h-16 bg-white/95 backdrop-blur-xl border-b border-slate-200 px-6 flex items-center justify-between z-[60] flex-shrink-0 sticky top-0">
-        <div className="flex items-center gap-4">
+        <div className="flex items-center gap-2 md:gap-4">
+          <button onClick={() => setShowAuthModal(true)} className="flex items-center gap-2 px-3 md:px-4 py-2 bg-slate-100 hover:bg-slate-200 rounded-xl text-slate-700 text-sm font-bold transition-all">
+             <UserCircle size={18} />
+             <span className="hidden md:inline">{isLoggedIn && !isAnonymous ? 'Account' : 'Save Progress'}</span>
+          </button>
           <button onClick={(e) => { e.stopPropagation(); setSidebarOpen(true); }} className="p-2.5 hover:bg-slate-100 rounded-xl text-slate-500 transition-all"><Menu size={20} /></button>
           <div className="flex items-center gap-2">
-            <div className="bg-indigo-600 p-2 rounded-xl text-white shadow-lg shadow-indigo-200"><Sparkles size={18} /></div>
-            <h1 className="font-black text-slate-900 tracking-tight text-xl">LocalityMind</h1>
+            <div className="bg-indigo-600 p-2 rounded-xl text-white shadow-lg shadow-indigo-200"><Layers size={18} /></div>
+            <h1 className="font-black text-slate-950 tracking-tight text-lg md:text-xl hidden sm:block">LocalityMind</h1>
           </div>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2 md:gap-3">
           {selectedIds.length > 0 && (
-            <button onClick={() => setCompareMode(!compareMode)} className={`flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest transition-all ${compareMode ? 'bg-indigo-600 text-white' : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100'}`}>
-              <ArrowRightLeft size={16} /> {compareMode ? 'Exit Comparison' : `Compare Synthesis (${selectedIds.length})`}
+            <button onClick={() => setCompareMode(!compareMode)} className={`flex items-center gap-2 px-3 md:px-5 py-2 md:py-2.5 rounded-xl text-[10px] md:text-xs font-black uppercase tracking-widest transition-all ${compareMode ? 'bg-indigo-600 text-white' : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100'}`}>
+              <ArrowRightLeft size={16} /> <span className="hidden md:inline">{compareMode ? 'Exit Comparison' : `Compare Synthesis (${selectedIds.length})`}</span>
             </button>
           )}
-          <button onClick={handleAnalyze} disabled={loading} className="bg-slate-950 text-white px-6 py-2.5 rounded-xl text-xs font-black uppercase tracking-widest flex items-center gap-2 hover:bg-slate-800 transition-all">
-            {loading ? <Loader2 size={16} className="animate-spin" /> : <Target size={16} />} Analyze
+          <button onClick={handleAnalyze} disabled={loading} className="bg-slate-950 text-white px-4 md:px-6 py-2 md:py-2.5 rounded-xl text-xs font-black uppercase tracking-widest flex items-center gap-2 hover:bg-slate-800 transition-all">
+            {loading ? <Loader2 size={16} className="animate-spin" /> : <Target size={16} />} <span className="hidden md:inline">Analyze</span>
           </button>
         </div>
       </header>
 
       {sidebarOpen && <div className="fixed inset-0 bg-slate-950/40 backdrop-blur-sm z-[70]" onClick={() => setSidebarOpen(false)} />}
-      <aside className={`fixed top-0 left-0 h-full w-96 bg-white shadow-2xl z-[80] transform transition-transform duration-500 flex flex-col ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+      <aside className={`fixed top-0 left-0 h-full w-96 max-w-[90vw] bg-white shadow-2xl z-[80] transform transition-transform duration-500 flex flex-col ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}`}>
         <div className="p-8 border-b border-slate-100 flex items-center justify-between">
             <span className="text-xs font-black uppercase tracking-[0.2em] text-slate-900">Synthesis Log</span>
             <button onClick={() => setSidebarOpen(false)} className="p-2 hover:bg-slate-100 rounded-xl text-slate-400"><X size={20} /></button>
@@ -574,14 +702,30 @@ const App: React.FC = () => {
                       <tr>
                          <td className="p-12 text-xs font-black uppercase text-slate-500 tracking-widest">Daily Traffic</td>
                          {history.filter(i => selectedIds.includes(i.id)).map(item => (
-                            <td key={item.id} className="p-12 text-2xl font-black text-slate-900">{item.metrics.footfallEstimate.daily.toLocaleString()}</td>
+                            <td key={item.id} className="p-12 text-2xl font-black text-slate-900">{(item.metrics?.footfallEstimate?.daily || 0).toLocaleString()}</td>
                          ))}
                       </tr>
                       <tr>
                          <td className="p-12 text-xs font-black uppercase text-slate-500 tracking-widest">Economy Tier</td>
                          {history.filter(i => selectedIds.includes(i.id)).map(item => (
-                            <td key={item.id} className="p-12 text-xl font-black text-slate-600">{item.demographics.socioeconomicTier}</td>
+                            <td key={item.id} className="p-12 text-xl font-black text-slate-600">{item.demographics?.socioeconomicTier || 'N/A'}</td>
                          ))}
+                      </tr>
+                      <tr>
+                         <td className="p-12 text-xs font-black uppercase text-slate-500 tracking-widest">Architecture</td>
+                         {history.filter(i => selectedIds.includes(i.id)).map(item => (
+                            <td key={item.id} className="p-12 text-lg font-black text-slate-700">{item.originalInput.length}x{item.originalInput.breadth}ft • {item.originalInput.floors} fl</td>
+                         ))}
+                      </tr>
+                      <tr>
+                         <td className="p-12 text-xs font-black uppercase text-slate-500 tracking-widest">Rev. Density</td>
+                         {history.filter(i => selectedIds.includes(i.id)).map(item => {
+                            const totalSqFt = (item.originalInput.length || 1) * (item.originalInput.breadth || 1) * (item.originalInput.floors || 1);
+                            const density = (item.revenueProjections?.monthly || 0) / totalSqFt;
+                            return (
+                               <td key={item.id} className="p-12 text-lg font-black text-emerald-600">{formatCurrency(density, item.originalInput.currency)}/sqft</td>
+                            )
+                         })}
                       </tr>
                    </tbody>
                 </table>
@@ -592,7 +736,7 @@ const App: React.FC = () => {
             <section className="relative w-full h-[calc(100vh-64px)] bg-slate-950 overflow-hidden flex-shrink-0">
               <div ref={mapContainer} className="w-full h-full" />
               
-              <div className="absolute top-10 right-10 z-30 pointer-events-auto">
+              <div className="hidden md:block absolute top-10 right-10 z-30 pointer-events-auto">
                  {currentResult && (
                    <div className="bg-slate-950/80 backdrop-blur-2xl border border-white/10 p-8 rounded-[3rem] shadow-2xl w-80 space-y-8 animate-in slide-in-from-right-10 duration-700">
                       <div className="flex items-center justify-between">
@@ -629,13 +773,25 @@ const App: React.FC = () => {
                             <div className="flex justify-between text-[9px] font-black text-white/30 uppercase tracking-widest">
                                <span className="flex items-center gap-1"><Users size={10} className="text-indigo-400"/> Pedestrian Flow</span>
                                <span className="text-white">
-                                 {Math.round((currentResult.metrics.footfallEstimate.hourlyDistribution.find(d => d.hour === mapTime)?.traffic || 0) / Math.max(...currentResult.metrics.footfallEstimate.hourlyDistribution.map(d => d.traffic)) * 100)}%
+                                 {(() => {
+                                    const dist = currentResult.metrics?.footfallEstimate?.hourlyDistribution || [];
+                                    if (dist.length === 0) return '0%';
+                                    const trafficAtHour = dist.find(d => d.hour === mapTime)?.traffic || 0;
+                                    const maxTraffic = Math.max(...dist.map(d => d.traffic));
+                                    return `${Math.round((trafficAtHour / (maxTraffic || 1)) * 100)}%`;
+                                 })()}
                                </span>
                             </div>
                             <div className="h-1.5 w-full bg-white/5 rounded-full overflow-hidden">
                                <div 
                                  className="h-full bg-gradient-to-r from-indigo-500 via-pink-500 to-red-500 transition-all duration-700" 
-                                 style={{ width: `${(currentResult.metrics.footfallEstimate.hourlyDistribution.find(d => d.hour === mapTime)?.traffic || 0) / Math.max(...currentResult.metrics.footfallEstimate.hourlyDistribution.map(d => d.traffic)) * 100}%` }} 
+                                 style={{ width: (() => {
+                                    const dist = currentResult.metrics?.footfallEstimate?.hourlyDistribution || [];
+                                    if (dist.length === 0) return '0%';
+                                    const trafficAtHour = dist.find(d => d.hour === mapTime)?.traffic || 0;
+                                    const maxTraffic = Math.max(...dist.map(d => d.traffic));
+                                    return `${(trafficAtHour / (maxTraffic || 1)) * 100}%`;
+                                 })() }} 
                                />
                             </div>
 
@@ -652,16 +808,13 @@ const App: React.FC = () => {
                  )}
               </div>
 
-              <div className="absolute bottom-12 right-12 z-30 pointer-events-auto">
+              <div className="hidden md:block absolute bottom-12 right-12 z-30 pointer-events-auto">
                 <div className="bg-slate-950/90 backdrop-blur-3xl border border-white/10 p-6 rounded-[2.5rem] shadow-2xl space-y-6 w-64 text-white">
                   <div className="flex items-center justify-between">
                     <span className="text-[10px] font-black uppercase tracking-widest text-white/40">Spatial Matrix</span>
                     <button onClick={resetCamera} className="p-2 hover:bg-white/10 rounded-xl text-white/60 transition-all"><RotateCcw size={14} /></button>
                   </div>
                   <div className="space-y-4">
-                    <button onClick={toggle3D} className={`w-full py-4 rounded-2xl flex items-center justify-center gap-3 transition-all border font-black text-[10px] uppercase tracking-widest ${is3D ? 'bg-indigo-600 border-indigo-400 text-white' : 'bg-white/5 border-white/10 text-white/40'}`}>
-                      <Box size={14} /> {is3D ? '3D Build-Out Active' : 'Engage 3D View'}
-                    </button>
                     <div className="space-y-2">
                       <div className="flex justify-between text-[9px] font-black text-white/30 uppercase tracking-widest"><span>Tilt</span><span className="text-indigo-400">{Math.round(pitch)}°</span></div>
                       <input type="range" min="0" max="85" value={pitch} onChange={(e) => handlePitchChange(Number(e.target.value))} className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-indigo-500" />
@@ -670,8 +823,8 @@ const App: React.FC = () => {
                 </div>
               </div>
 
-              <div className="absolute inset-y-0 left-0 z-40 w-full max-w-5xl p-10 flex flex-col justify-center pointer-events-none">
-                <div className={`pointer-events-auto bg-slate-950/80 backdrop-blur-3xl p-12 rounded-[4rem] border border-white/10 shadow-2xl space-y-10 text-white transition-all duration-700 ease-in-out overflow-hidden ${isPanelExpanded ? 'w-[800px]' : 'w-[550px]'}`}>
+              <div className="absolute inset-y-0 left-0 z-40 w-full max-w-5xl p-4 lg:p-10 flex flex-col justify-center pointer-events-none">
+                <div className={`pointer-events-auto bg-slate-950/80 backdrop-blur-3xl p-6 md:p-12 rounded-[2rem] md:rounded-[4rem] border border-white/10 shadow-2xl space-y-6 md:space-y-10 text-white transition-all duration-700 ease-in-out overflow-hidden max-w-full ${isPanelExpanded ? 'w-full md:w-[800px]' : 'w-full md:w-[550px]'}`}>
                   <div className="flex items-center justify-between border-b border-white/10 pb-6">
                     <div className="flex items-center gap-3">
                       <Target size={14} className="text-indigo-400" />
@@ -684,8 +837,15 @@ const App: React.FC = () => {
                     </div>
                     {(isSearchingLocality || loading) && <Loader2 size={16} className="animate-spin text-indigo-400" />}
                   </div>
+                  
+                  {error && (
+                    <div className="bg-red-500/10 border border-red-500/30 p-4 rounded-2xl flex items-start gap-3 mt-4 text-red-400">
+                       <AlertCircle size={16} className="mt-0.5 flex-shrink-0" />
+                       <div className="text-xs font-medium leading-relaxed">{error}</div>
+                    </div>
+                  )}
 
-                  <div className="space-y-8 max-h-[60vh] overflow-y-auto custom-scrollbar pr-4">
+                  <div className="space-y-6 md:space-y-8 max-h-[60vh] overflow-y-auto custom-scrollbar pr-2 md:pr-4 pt-2 md:pt-4">
                     <div className="relative">
                       <label className="block text-[10px] font-black text-white/30 mb-4 uppercase tracking-[0.2em] flex items-center justify-between">
                         Target Locality
@@ -757,8 +917,8 @@ const App: React.FC = () => {
                       )}
                     </div>
 
-                    <div className="space-y-8 bg-white/5 p-8 rounded-[3rem] border border-white/5">
-                      <div className="grid grid-cols-2 gap-6">
+                    <div className="space-y-6 md:space-y-8 bg-white/5 p-4 md:p-8 rounded-[2rem] md:rounded-[3rem] border border-white/5">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
                         <div className="space-y-4">
                           <label className="block text-[10px] font-black text-white/30 uppercase tracking-widest flex items-center gap-2">Target Pricing Matrix</label>
                           <div className="grid grid-cols-2 gap-2">
@@ -798,7 +958,7 @@ const App: React.FC = () => {
                         />
                       </div>
 
-                      <div className="grid grid-cols-3 gap-6 pt-4 border-t border-white/5">
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6 pt-4 border-t border-white/5">
                          <div className="space-y-3">
                             <label className="block text-[10px] font-black text-white/30 uppercase tracking-widest">Width (ft)</label>
                             <input type="number" value={input.length} onChange={(e) => setInput(p => ({...p, length: Number(e.target.value)}))} className="w-full bg-white/5 border border-white/10 rounded-2xl py-4 px-5 text-sm font-black text-white outline-none" />
@@ -836,34 +996,34 @@ const App: React.FC = () => {
               </div>
             </section>
 
-            <div id="results-view" className="bg-white min-h-screen relative z-30 shadow-[0_-40px_100px_rgba(0,0,0,0.1)] rounded-t-[5rem]">
-              <div className="p-10 lg:p-24 space-y-32">
+            <div id="results-view" className="bg-white min-h-screen relative z-30 shadow-[0_-40px_100px_rgba(0,0,0,0.1)] rounded-t-[3rem] md:rounded-t-[5rem]">
+              <div className="p-6 md:p-10 lg:p-24 space-y-16 md:space-y-32">
                 {currentResult ? (
-                  <div className="space-y-32 animate-in fade-in slide-in-from-bottom-20 duration-1000">
-                    <div className="flex flex-col lg:flex-row gap-16 items-end justify-between border-b border-slate-100 pb-24">
-                       <div className="space-y-8 max-w-4xl">
-                          <div className="flex items-center gap-4">
-                            <span className="px-6 py-2.5 bg-slate-950 text-white rounded-full text-[10px] font-black uppercase tracking-[0.4em]">Strategic Synthesis Complete</span>
+                  <div className="space-y-16 md:space-y-32 animate-in fade-in slide-in-from-bottom-20 duration-1000">
+                    <div className="flex flex-col lg:flex-row gap-8 md:gap-16 items-end justify-between border-b border-slate-100 pb-12 md:pb-24">
+                       <div className="space-y-6 md:space-y-8 max-w-4xl">
+                          <div className="flex items-center gap-2 md:gap-4 flex-wrap">
+                            <span className="px-4 md:px-6 py-2 md:py-2.5 bg-slate-950 text-white rounded-full text-[10px] font-black uppercase tracking-[0.4em]">Strategic Synthesis Complete</span>
                             <span className="text-[10px] font-black text-slate-300 uppercase tracking-widest">{currentResult.originalInput.pricingTier} Tier • {currentResult.originalInput.currency}</span>
                           </div>
-                          <h2 className="text-[10rem] font-black tracking-tighter text-slate-950 leading-[0.75] mb-8">{currentResult.localityName.split(',')[0]}</h2>
+                          <h2 className="text-5xl sm:text-6xl md:text-[8rem] lg:text-[10rem] font-black tracking-tighter text-slate-950 leading-[0.8] mb-4 md:mb-8">{currentResult.localityName.split(',')[0]}</h2>
                        </div>
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-12">
-                      <MetricCard title="Footfall Velocity" value={currentResult.metrics.footfallEstimate.daily.toLocaleString()} Icon={Users} subtitle="Daily Visitors" />
-                      <MetricCard title="Affluence Proxy" value={formatCurrency(currentResult.demographics.perCapitaIncome, currentResult.originalInput.currency)} Icon={CircleDollarSign} subtitle={currentResult.demographics.socioeconomicTier} />
-                      <MetricCard title="Built Density" value={currentResult.demographics.populationDensity} Icon={Building2} subtitle="Built Form" />
-                      <MetricCard title="Rival Count" value={currentResult.metrics.storeCompetition.length} Icon={ShoppingBag} subtitle="Active Rivals" />
+                      <MetricCard title="Footfall Velocity" value={(currentResult.metrics?.footfallEstimate?.daily || 0).toLocaleString()} Icon={Users} subtitle="Daily Visitors" />
+                      <MetricCard title="Affluence Proxy" value={formatCurrency(currentResult.demographics?.perCapitaIncome || 0, currentResult.originalInput?.currency)} Icon={CircleDollarSign} subtitle={currentResult.demographics?.socioeconomicTier || 'N/A'} />
+                      <MetricCard title="Built Density" value={currentResult.demographics?.populationDensity || 'N/A'} Icon={Building2} subtitle="Built Form" />
+                      <MetricCard title="Rival Count" value={currentResult.metrics?.storeCompetition?.length || 0} Icon={ShoppingBag} subtitle="Active Rivals" />
                     </div>
 
                     <div className="grid grid-cols-1 xl:grid-cols-2 gap-20">
-                      <RevenueChart projections={currentResult.revenueProjections} />
-                      <TrafficLandscape data={currentResult.metrics.footfallEstimate.hourlyDistribution} />
+                      <RevenueChart projections={currentResult.revenueProjections || { monthly: 0, quarterly: 0, yearly: 0, currency: 'USD' }} />
+                      <TrafficLandscape data={currentResult.metrics?.footfallEstimate?.hourlyDistribution || []} />
                     </div>
 
                     <div className="w-full">
-                      <CompetitionPanel competition={currentResult.metrics.storeCompetition} />
+                      <CompetitionPanel competition={currentResult.metrics?.storeCompetition || []} />
                     </div>
 
                     {/* Grounding Sources Section */}
@@ -909,7 +1069,7 @@ const App: React.FC = () => {
                   </div>
                 ) : (
                   <div className="min-h-[80vh] flex flex-col items-center justify-center text-center p-20 opacity-30">
-                    <Activity size={100} className="text-indigo-600 mb-8" />
+                    <Compass size={100} className="text-indigo-600 mb-8" />
                     <h3 className="text-5xl font-black text-slate-900 mb-4 tracking-tighter">Locality Processor Idle</h3>
                     <p className="text-xs text-slate-500 font-black uppercase tracking-[0.5em]">Calibrate recon panel to initiate synthesis</p>
                   </div>
@@ -919,6 +1079,14 @@ const App: React.FC = () => {
           </div>
         )}
       </main>
+
+      {showAuthModal && (
+        <AuthModal 
+          onClose={() => setShowAuthModal(false)} 
+          isAnonymous={isAnonymous} 
+          isLoggedIn={isLoggedIn} 
+        />
+      )}
     </div>
   );
 };
